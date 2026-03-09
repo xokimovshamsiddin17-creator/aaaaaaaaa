@@ -481,14 +481,12 @@ class Database:
     def get_top_referrers(self, limit: int = 10) -> List[Dict[str, Any]]:
         with self.get_connection() as conn:
             cursor = conn.cursor()
-            # Real-time hisoblash: referred_by column orqali aniq hisob
+            # Subquery orqali — hech qanday chalkashlik yo'q
             cursor.execute('''
                 SELECT u.telegram_id, u.first_name, u.username,
-                       COUNT(r.telegram_id) as ref_cnt
+                       (SELECT COUNT(*) FROM users r WHERE r.referred_by = u.telegram_id) AS ref_cnt
                 FROM users u
-                LEFT JOIN users r ON r.referred_by = u.telegram_id
-                GROUP BY u.telegram_id
-                HAVING ref_cnt > 0
+                WHERE (SELECT COUNT(*) FROM users r WHERE r.referred_by = u.telegram_id) > 0
                 ORDER BY ref_cnt DESC
                 LIMIT ?
             ''', (limit,))
