@@ -481,11 +481,15 @@ class Database:
     def get_top_referrers(self, limit: int = 10) -> List[Dict[str, Any]]:
         with self.get_connection() as conn:
             cursor = conn.cursor()
+            # Real-time hisoblash: referred_by column orqali aniq hisob
             cursor.execute('''
-                SELECT telegram_id, first_name, username, referral_count
-                FROM users
-                WHERE referral_count > 0
-                ORDER BY referral_count DESC
+                SELECT u.telegram_id, u.first_name, u.username,
+                       COUNT(r.telegram_id) as ref_cnt
+                FROM users u
+                LEFT JOIN users r ON r.referred_by = u.telegram_id
+                GROUP BY u.telegram_id
+                HAVING ref_cnt > 0
+                ORDER BY ref_cnt DESC
                 LIMIT ?
             ''', (limit,))
             rows = cursor.fetchall()
@@ -494,9 +498,12 @@ class Database:
     def get_referral_count(self, telegram_id: int) -> int:
         with self.get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute('SELECT referral_count FROM users WHERE telegram_id = ?', (telegram_id,))
+            # Real-time hisoblash
+            cursor.execute('''
+                SELECT COUNT(*) as cnt FROM users WHERE referred_by = ?
+            ''', (telegram_id,))
             row = cursor.fetchone()
-            return row['referral_count'] if row else 0
+            return row['cnt'] if row else 0
 
 # ==================== STATES ====================
 
@@ -1704,28 +1711,33 @@ class BotHandlers:
         @self.dp.callback_query(F.data == "sa_referral_leaderboard")
         async def sa_referral_leaderboard(callback: CallbackQuery):
             if not self.db.is_super_admin(callback.from_user.id):
+                await callback.answer("❌ Ruxsat yo'q!", show_alert=True)
                 return
                 
             top_referrers = self.db.get_top_referrers(10)
             
             if not top_referrers:
                 await callback.message.edit_text(
-                    "📊 *Referallar mavjud emas!*",
+                    "📊 *Hali hech kim referal qo'shmagan!*\n\n"
+                    "Foydalanuvchilar referal havolasi orqali yangi odamlarni taklif qilganida bu yerda ko'rinadi.",
                     parse_mode="Markdown",
                     reply_markup=get_super_admin_keyboard()
                 )
+                await callback.answer()
                 return
             
             text = "🏆 *Referallar Leaderboard (Top 10)*\n\n"
             for i, ref in enumerate(top_referrers, 1):
+                medal = {1: "🥇", 2: "🥈", 3: "🥉"}.get(i, f"{i}️⃣")
                 username = f" (@{ref['username']})" if ref['username'] else ""
-                text += f"{i}. [{ref['first_name']}](tg://user?id={ref['telegram_id']}){username} — *{ref['referral_count']}* ta\n"
+                text += f"{medal} [{ref['first_name']}](tg://user?id={ref['telegram_id']}){username} — *{ref['ref_cnt']}* ta\n"
             
             # G'olibga xabar yuborish tugmasi
             winner = top_referrers[0]
             buttons = [
                 [InlineKeyboardButton(text=f"🎁 G'olibga xabar yuborish ({winner['first_name']})", 
                                      callback_data=f"sa_not_winner_{winner['telegram_id']}")],
+                [InlineKeyboardButton(text="↩️ Admin panelga qaytish", callback_data="super_admin")],
                 [InlineKeyboardButton(text="🏠 Bosh menyu", callback_data="back_to_main")]
             ]
             
