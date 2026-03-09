@@ -722,8 +722,8 @@ def get_super_admin_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="👥 Foydalanuvchilar", callback_data="sa_users")],
         [InlineKeyboardButton(text="📊 Umumiy statistika", callback_data="sa_stats")],
         [InlineKeyboardButton(text="📢 Barcha kanallar", callback_data="sa_all_channels")],
-        [InlineKeyboardButton(text="� Referallar Leaderboard", callback_data="sa_referral_leaderboard")],
-        [InlineKeyboardButton(text="�🏠 Bosh menyu", callback_data="back_to_main")]
+        [InlineKeyboardButton(text="🏆 Referallar Leaderboard", callback_data="sa_referral_leaderboard")],
+        [InlineKeyboardButton(text="🏠 Bosh menyu", callback_data="back_to_main")]
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
