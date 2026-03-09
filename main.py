@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, F, BaseMiddleware
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandStart, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -74,9 +74,19 @@ class Database:
                     max_file_size INTEGER DEFAULT 52428800,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    subscription_expires TIMESTAMP
+                    subscription_expires TIMESTAMP,
+                    referred_by INTEGER,
+                    referral_count INTEGER DEFAULT 0
                 )
             ''')
+            
+            # Migration: Add referral columns if they don't exist
+            cursor.execute("PRAGMA table_info(users)")
+            columns = [column[1] for column in cursor.fetchall()]
+            if 'referred_by' not in columns:
+                cursor.execute('ALTER TABLE users ADD COLUMN referred_by INTEGER')
+            if 'referral_count' not in columns:
+                cursor.execute('ALTER TABLE users ADD COLUMN referral_count INTEGER DEFAULT 0')
             
             # Files table
             cursor.execute('''
@@ -175,7 +185,7 @@ class Database:
     # ========== USER METHODS ==========
     
     def add_user(self, telegram_id: int, first_name: str, username: Optional[str] = None, 
-                 last_name: Optional[str] = None) -> None:
+                 last_name: Optional[str] = None, referred_by: Optional[int] = None) -> None:
         with self.get_connection() as conn:
             cursor = conn.cursor()
             
@@ -195,10 +205,18 @@ class Database:
                 cursor.execute('''
                     INSERT INTO users (
                         telegram_id, username, first_name, last_name, 
-                        is_admin, max_files, max_channels, max_file_size
+                        is_admin, max_files, max_channels, max_file_size,
+                        referred_by
                     )
-                    VALUES (?, ?, ?, ?, 1, 10, 3, 52428800)
-                ''', (telegram_id, username, first_name, last_name))
+                    VALUES (?, ?, ?, ?, 1, 10, 3, 52428800, ?)
+                ''', (telegram_id, username, first_name, last_name, referred_by))
+                
+                # If referred by someone, increment their count
+                if referred_by and referred_by != telegram_id:
+                    cursor.execute('''
+                        UPDATE users SET referral_count = referral_count + 1
+                        WHERE telegram_id = ?
+                    ''', (referred_by,))
                 
                 cursor.execute('''
                     INSERT OR IGNORE INTO user_stats (user_id)
@@ -460,6 +478,26 @@ class Database:
             
             return stats
 
+    def get_top_referrers(self, limit: int = 10) -> List[Dict[str, Any]]:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT telegram_id, first_name, username, referral_count
+                FROM users
+                WHERE referral_count > 0
+                ORDER BY referral_count DESC
+                LIMIT ?
+            ''', (limit,))
+            rows = cursor.fetchall()
+            return [dict(row) for row in rows]
+
+    def get_referral_count(self, telegram_id: int) -> int:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT referral_count FROM users WHERE telegram_id = ?', (telegram_id,))
+            row = cursor.fetchone()
+            return row['referral_count'] if row else 0
+
 # ==================== STATES ====================
 
 class UserStates(StatesGroup):
@@ -584,7 +622,8 @@ def get_main_menu_keyboard(is_super_admin: bool = False) -> InlineKeyboardMarkup
          InlineKeyboardButton(text="➖ Kanal o'chirish", callback_data="remove_channel")],
         [InlineKeyboardButton(text="📋 Kanallarim", callback_data="list_my_channels"),
          InlineKeyboardButton(text="📊 Mening statistikam", callback_data="my_stats")],
-        [InlineKeyboardButton(text="🔑 Kod yuborish", callback_data="send_code")],
+        [InlineKeyboardButton(text="🔑 Kod yuborish", callback_data="send_code"),
+         InlineKeyboardButton(text="👥 Referallar", callback_data="referral_menu")],
         [InlineKeyboardButton(text="⚙️ Sozlamalar", callback_data="settings")]
     ]
     
@@ -594,6 +633,10 @@ def get_main_menu_keyboard(is_super_admin: bool = False) -> InlineKeyboardMarkup
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 def get_back_keyboard() -> InlineKeyboardMarkup:
+    buttons = [[InlineKeyboardButton(text="🏠 Bosh menyu", callback_data="back_to_main")]]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def get_referral_keyboard() -> InlineKeyboardMarkup:
     buttons = [[InlineKeyboardButton(text="🏠 Bosh menyu", callback_data="back_to_main")]]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -679,7 +722,8 @@ def get_super_admin_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="👥 Foydalanuvchilar", callback_data="sa_users")],
         [InlineKeyboardButton(text="📊 Umumiy statistika", callback_data="sa_stats")],
         [InlineKeyboardButton(text="📢 Barcha kanallar", callback_data="sa_all_channels")],
-        [InlineKeyboardButton(text="🏠 Bosh menyu", callback_data="back_to_main")]
+        [InlineKeyboardButton(text="� Referallar Leaderboard", callback_data="sa_referral_leaderboard")],
+        [InlineKeyboardButton(text="�🏠 Bosh menyu", callback_data="back_to_main")]
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -816,14 +860,50 @@ class BotHandlers:
     def setup_handlers(self):
         
         @self.dp.message(CommandStart())
-        async def cmd_start(message: Message):
+        async def cmd_start(message: Message, command: CommandObject):
             user = message.from_user
+            referred_by = None
+            
+            # Handle referral code
+            if command.args and command.args.startswith('ref_'):
+                try:
+                    ref_id = int(command.args.split('_')[1])
+                    if ref_id != user.id:
+                        referred_by = ref_id
+                    else:
+                        await message.answer("⚠️ *O'zingizga o'zingiz referal bo'la olmaysiz!*", parse_mode="Markdown")
+                except Exception as e:
+                    logger.error(f"Error parsing referral code: {e}")
+            
+            # Check if user is new BEFORE adding
+            is_new_user = self.db.get_user(user.id) is None
+            
             self.db.add_user(
                 telegram_id=user.id,
                 first_name=user.first_name,
                 username=user.username,
-                last_name=user.last_name
+                last_name=user.last_name,
+                referred_by=referred_by
             )
+            
+            # Notify referrer if new user
+            if referred_by:
+                if is_new_user:
+                    try:
+                        await self.bot.send_message(
+                            referred_by,
+                            f"🎉 *Yangi referal!* \n\n"
+                            f"Foydalanuvchi [{user.first_name}](tg://user?id={user.id}) sizning havolangiz orqali qo'shildi.",
+                            parse_mode="Markdown"
+                        )
+                        await message.answer(f"✅ Siz referal orqali qo'shildingiz!")
+                    except Exception as e:
+                        logger.error(f"Error notifying referrer: {e}")
+                else:
+                    await message.answer(
+                        "ℹ️ *Siz allaqachon botdan foydalangansiz, shuning uchun taklif qiluvchiga ball berilmadi.*",
+                        parse_mode="Markdown"
+                    )
             
             limits = self.db.get_user_limits(user.id)
             stats = self.db.get_user_stats(user.id)
@@ -953,6 +1033,30 @@ class BotHandlers:
                 text,
                 parse_mode="Markdown",
                 reply_markup=get_back_keyboard()
+            )
+            await callback.answer()
+        
+        @self.dp.callback_query(F.data == "referral_menu")
+        async def referral_menu(callback: CallbackQuery):
+            user_id = callback.from_user.id
+            bot_info = await self.bot.get_me()
+            bot_username = bot_info.username
+            referral_link = f"https://t.me/{bot_username}?start=ref_{user_id}"
+            referral_count = self.db.get_referral_count(user_id)
+            
+            text = (
+                f"👥 *Referal tizimi*\n\n"
+                f"Sizning referal havolangiz:\n"
+                f"`{referral_link}`\n\n"
+                f"📊 *Sizning statistikangiz:*\n"
+                f"Taklif qilingan do'stlar: *{referral_count}* ta\n\n"
+                "Ushbu havola orqali do'stlaringizni taklif qiling va sovg'alarga ega bo'ling!"
+            )
+            
+            await callback.message.edit_text(
+                text,
+                parse_mode="Markdown",
+                reply_markup=get_referral_keyboard()
             )
             await callback.answer()
         
@@ -1596,6 +1700,58 @@ class BotHandlers:
                 reply_markup=get_back_keyboard()
             )
             await callback.answer()
+
+        @self.dp.callback_query(F.data == "sa_referral_leaderboard")
+        async def sa_referral_leaderboard(callback: CallbackQuery):
+            if not self.db.is_super_admin(callback.from_user.id):
+                return
+                
+            top_referrers = self.db.get_top_referrers(10)
+            
+            if not top_referrers:
+                await callback.message.edit_text(
+                    "📊 *Referallar mavjud emas!*",
+                    parse_mode="Markdown",
+                    reply_markup=get_super_admin_keyboard()
+                )
+                return
+            
+            text = "🏆 *Referallar Leaderboard (Top 10)*\n\n"
+            for i, ref in enumerate(top_referrers, 1):
+                username = f" (@{ref['username']})" if ref['username'] else ""
+                text += f"{i}. [{ref['first_name']}](tg://user?id={ref['telegram_id']}){username} — *{ref['referral_count']}* ta\n"
+            
+            # G'olibga xabar yuborish tugmasi
+            winner = top_referrers[0]
+            buttons = [
+                [InlineKeyboardButton(text=f"🎁 G'olibga xabar yuborish ({winner['first_name']})", 
+                                     callback_data=f"sa_not_winner_{winner['telegram_id']}")],
+                [InlineKeyboardButton(text="🏠 Bosh menyu", callback_data="back_to_main")]
+            ]
+            
+            await callback.message.edit_text(
+                text,
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+            )
+            await callback.answer()
+
+        @self.dp.callback_query(F.data.startswith("sa_not_winner_"))
+        async def sa_notify_winner(callback: CallbackQuery):
+            winner_id = int(callback.data.split('_')[3])
+            
+            try:
+                await self.bot.send_message(
+                    winner_id,
+                    "🎉 *Tabriklaymiz!* 🎉\n\n"
+                    "Siz ko'p odam taklif qilganingiz uchun referal tanlovida g'olib bo'ldingiz! 🎁\n\n"
+                    "Admin tez orada siz bilan bog'lanadi.",
+                    parse_mode="Markdown"
+                )
+                await callback.answer("✅ G'olibga xabar yuborildi!", show_alert=True)
+            except Exception as e:
+                logger.error(f"Error notifying winner: {e}")
+                await callback.answer("❌ Xabar yuborishda xatolik!", show_alert=True)
 
 # ==================== MAIN BOT CLASS ====================
 
